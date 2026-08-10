@@ -20,8 +20,17 @@ const Version = 3
 
 const headerAPIVersion = "X-Pm-Apiversion"
 
+// API error codes.
+const (
+	CodeHumanVerificationRequired = 9001
+	CodeInvalidRefreshToken       = 10013
+)
+
 type resp struct {
 	Code int
+	// Details is an arbitrary object some errors carry extra context in. Its
+	// shape depends on the error, so it is kept raw and decoded on demand.
+	Details json.RawMessage
 	*RawAPIError
 }
 
@@ -30,6 +39,7 @@ func (r *resp) Err() error {
 		return &APIError{
 			Code:    r.Code,
 			Message: err.Message,
+			Details: r.Details,
 		}
 	}
 	return nil
@@ -46,10 +56,37 @@ type RawAPIError struct {
 type APIError struct {
 	Code    int
 	Message string
+	Details json.RawMessage
 }
 
 func (err *APIError) Error() string {
 	return fmt.Sprintf("[%v] %v", err.Code, err.Message)
+}
+
+// HumanVerification reports whether the API answered with a human verification
+// challenge. If it did, it returns the verification token identifying the
+// challenge along with the methods the API is willing to accept to solve it
+// (see the HumanVerification* constants).
+func (err *APIError) HumanVerification() (token string, methods []string, ok bool) {
+	if err.Code != CodeHumanVerificationRequired || len(err.Details) == 0 {
+		return "", nil, false
+	}
+
+	var details struct {
+		HumanVerificationToken   string
+		HumanVerificationMethods []string
+	}
+	if json.Unmarshal(err.Details, &details) != nil {
+		// Details is not an object for every error, and the API is free to
+		// change its shape: a challenge we can't read is a challenge we can't
+		// solve, not a hard failure.
+		return "", nil, false
+	}
+	if details.HumanVerificationToken == "" {
+		return "", nil, false
+	}
+
+	return details.HumanVerificationToken, details.HumanVerificationMethods, true
 }
 
 type Timestamp int64
@@ -64,12 +101,20 @@ type Client struct {
 	AppVersion string
 	Debug      bool
 
+	// CaptchaRootURL overrides the host CAPTCHA challenges are loaded from.
+	// Defaults to DefaultCaptchaRootURL, which is not necessarily RootURL —
+	// see that constant for why.
+	CaptchaRootURL string
+
 	HTTPClient *http.Client
 	ReAuth     func() error
 
 	uid         string
 	accessToken string
 	keyRing     openpgp.EntityList
+
+	hvToken     string
+	hvTokenType string
 }
 
 func (c *Client) setRequestAuthorization(req *http.Request) {
@@ -77,6 +122,26 @@ func (c *Client) setRequestAuthorization(req *http.Request) {
 		req.Header.Set("X-Pm-Uid", c.uid)
 		req.Header.Set("Authorization", "Bearer "+c.accessToken)
 	}
+}
+
+// SetHumanVerification attaches a solved human verification token to every
+// subsequent request, which is how a request rejected with
+// CodeHumanVerificationRequired is retried. tokenType is the method the token
+// was obtained with (see the HumanVerification* constants).
+//
+// An empty token clears the verification, which callers should do once the
+// request that needed it has gone through.
+func (c *Client) SetHumanVerification(token, tokenType string) {
+	c.hvToken = token
+	c.hvTokenType = tokenType
+}
+
+func (c *Client) setRequestHumanVerification(req *http.Request) {
+	if c.hvToken == "" {
+		return
+	}
+	req.Header.Set("X-Pm-Human-Verification-Token", c.hvToken)
+	req.Header.Set("X-Pm-Human-Verification-Token-Type", c.hvTokenType)
 }
 
 func (c *Client) newRequest(method, path string, body io.Reader) (*http.Request, error) {
@@ -92,6 +157,7 @@ func (c *Client) newRequest(method, path string, body io.Reader) (*http.Request,
 	req.Header.Set("X-Pm-Appversion", c.AppVersion)
 	req.Header.Set(headerAPIVersion, strconv.Itoa(Version))
 	c.setRequestAuthorization(req)
+	c.setRequestHumanVerification(req)
 	return req, nil
 }
 

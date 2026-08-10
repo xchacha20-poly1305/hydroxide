@@ -10,6 +10,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -68,6 +70,105 @@ func askPass(prompt string) ([]byte, error) {
 		fmt.Fprintf(os.Stderr, "\n")
 	}
 	return b, err
+}
+
+// stdinScanner is shared so that prompts issued one after another don't lose
+// input to each other's buffering.
+var stdinScanner = bufio.NewScanner(os.Stdin)
+
+func askLine(prompt string) (string, error) {
+	fmt.Fprintf(os.Stderr, "%v: ", prompt)
+	if !stdinScanner.Scan() {
+		if err := stdinScanner.Err(); err != nil {
+			return "", err
+		}
+		return "", io.ErrUnexpectedEOF
+	}
+	return strings.TrimSpace(stdinScanner.Text()), nil
+}
+
+// solveHumanVerification walks the user through a human verification challenge
+// and, on success, attaches the resulting token to c.
+func solveHumanVerification(c *protonmail.Client, apiErr *protonmail.APIError) error {
+	token, methods, _ := apiErr.HumanVerification()
+
+	method, err := chooseVerificationMethod(methods)
+	if err != nil {
+		return err
+	}
+
+	switch method {
+	case protonmail.HumanVerificationCaptcha:
+		solved, err := solveCaptcha(c.CaptchaURL(token))
+		if err != nil {
+			return err
+		}
+		c.SetHumanVerification(solved, method)
+
+	case protonmail.HumanVerificationEmail, protonmail.HumanVerificationSMS:
+		what := "email address"
+		if method == protonmail.HumanVerificationSMS {
+			what = "phone number"
+		}
+
+		destination, err := askLine("Verification " + what)
+		if err != nil {
+			return err
+		}
+		if destination == "" {
+			return fmt.Errorf("no %v provided", what)
+		}
+
+		if err := c.RequestVerificationCode(method, destination); err != nil {
+			return fmt.Errorf("failed to request a verification code: %v", err)
+		}
+
+		code, err := askLine("Verification code")
+		if err != nil {
+			return err
+		}
+		if code == "" {
+			return fmt.Errorf("no verification code provided")
+		}
+		c.SetHumanVerification(destination+":"+code, method)
+	}
+
+	return nil
+}
+
+func chooseVerificationMethod(methods []string) (string, error) {
+	var supported []string
+	for _, method := range methods {
+		switch method {
+		case protonmail.HumanVerificationCaptcha, protonmail.HumanVerificationEmail, protonmail.HumanVerificationSMS:
+			supported = append(supported, method)
+		}
+	}
+
+	switch len(supported) {
+	case 0:
+		return "", fmt.Errorf("none of the verification methods offered by the server are supported: %v",
+			strings.Join(methods, ", "))
+	case 1:
+		return supported[0], nil
+	}
+
+	fmt.Fprintf(os.Stderr, "\nProton requires human verification. Available methods:\n")
+	for i, method := range supported {
+		fmt.Fprintf(os.Stderr, "  %v) %v\n", i+1, method)
+	}
+
+	for {
+		choice, err := askLine("Method")
+		if err != nil {
+			return "", err
+		}
+		n, err := strconv.Atoi(choice)
+		if err == nil && n >= 1 && n <= len(supported) {
+			return supported[n-1], nil
+		}
+		fmt.Fprintf(os.Stderr, "Please enter a number between 1 and %v.\n", len(supported))
+	}
 }
 
 func askBridgePass() (string, error) {
@@ -325,19 +426,35 @@ func main() {
 			}
 
 			a, err = c.Auth(username, loginPassword, authInfo)
+			if apiErr, ok := err.(*protonmail.APIError); ok {
+				if _, _, needsVerification := apiErr.HumanVerification(); needsVerification {
+					if err := solveHumanVerification(c, apiErr); err != nil {
+						log.Fatal(err)
+					}
+
+					// The SRP session of the rejected attempt is spent, so the
+					// exchange has to start over — this time with the
+					// verification token attached to every request.
+					if authInfo, err = c.AuthInfo(username); err != nil {
+						log.Fatal(err)
+					}
+					a, err = c.Auth(username, loginPassword, authInfo)
+				}
+			}
 			if err != nil {
 				log.Fatal(err)
 			}
+			c.SetHumanVerification("", "")
 
 			if a.TwoFactor.Enabled != 0 {
 				if a.TwoFactor.TOTP != 1 {
 					log.Fatal("Only TOTP is supported as a 2FA method")
 				}
 
-				scanner := bufio.NewScanner(os.Stdin)
-				fmt.Printf("2FA TOTP code: ")
-				scanner.Scan()
-				code := scanner.Text()
+				code, err := askLine("2FA TOTP code")
+				if err != nil {
+					log.Fatal(err)
+				}
 
 				scope, err := c.AuthTOTP(code)
 				if err != nil {
