@@ -38,6 +38,8 @@ var (
 	debug       bool
 	apiEndpoint string
 	appVersion  string
+
+	newHTTPClient = func() *http.Client { return http.DefaultClient }
 )
 
 func newClient() *protonmail.Client {
@@ -45,6 +47,7 @@ func newClient() *protonmail.Client {
 		RootURL:    apiEndpoint,
 		AppVersion: appVersion,
 		Debug:      debug,
+		HTTPClient: newHTTPClient(),
 	}
 }
 
@@ -192,6 +195,11 @@ Global options:
 		ProtonMail API endpoint
 	-app-version <version>
 		ProtonMail application version
+	-proxy <url>
+		Proxy for ProtonMail API requests, e.g. socks5://127.0.0.1:1080
+	-tor
+		Connect to the ProtonMail onion service through Tor, -proxy defaults to
+		socks5://127.0.0.1:9050
 	-smtp-host example.com
 		Allowed SMTP email hostname on which hydroxide listens, defaults to 127.0.0.1
 	-imap-host example.com
@@ -225,6 +233,8 @@ func main() {
 	flag.BoolVar(&debug, "debug", false, "Enable debug logs")
 	flag.StringVar(&apiEndpoint, "api-endpoint", defaultAPIEndpoint, "ProtonMail API endpoint")
 	flag.StringVar(&appVersion, "app-version", defaultAppVersion, "ProtonMail app version")
+	proxy := flag.String("proxy", "", "Proxy for ProtonMail API requests, e.g. socks5://127.0.0.1:1080")
+	tor := flag.Bool("tor", false, "Connect to the ProtonMail onion service through Tor")
 
 	smtpHost := flag.String("smtp-host", "127.0.0.1", "Allowed SMTP email hostname on which hydroxide listens, defaults to 127.0.0.1")
 	smtpPort := flag.String("smtp-port", "1025", "SMTP port on which hydroxide listens, defaults to 1025")
@@ -257,6 +267,27 @@ func main() {
 	tlsConfig, err := config.TLS(*tlsCert, *tlsCertKey, *tlsClientCA)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	if *tor {
+		apiEndpointSet := false
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == "api-endpoint" {
+				apiEndpointSet = true
+			}
+		})
+		if !apiEndpointSet {
+			apiEndpoint = torAPIEndpoint
+		}
+		if *proxy == "" {
+			*proxy = defaultTorProxy
+		}
+	}
+	if *proxy != "" {
+		newHTTPClient, err = newProxyHTTPClientFunc(*proxy, *tor)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	cmd := flag.Arg(0)

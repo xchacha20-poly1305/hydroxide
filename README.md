@@ -101,6 +101,23 @@ For now, it only supports unencrypted local connections.
 hydroxide imap
 ```
 
+### Proxy and Tor
+
+To send ProtonMail API requests through a proxy, pass `-proxy` before the
+command (the `HTTPS_PROXY` environment variable is honored as well):
+
+```shell
+hydroxide -proxy socks5://127.0.0.1:1080 serve
+```
+
+With `-tor`, hydroxide connects to the ProtonMail onion service through the Tor
+SOCKS port (`socks5://127.0.0.1:9050` unless `-proxy` is set). Each session
+uses a separate Tor circuit.
+
+```shell
+hydroxide -tor serve
+```
+
 ## Contributing
 
 This project is [casually maintained]: pull requests are welcome, but the
