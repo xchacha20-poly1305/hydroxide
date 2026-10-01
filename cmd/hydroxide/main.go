@@ -31,7 +31,7 @@ import (
 
 const (
 	defaultAPIEndpoint = "https://mail.proton.me/api"
-	defaultAppVersion  = "Other"
+	defaultAppVersion  = "web-mail@5.0.134.7"
 )
 
 var (
